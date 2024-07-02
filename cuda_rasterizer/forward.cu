@@ -153,6 +153,44 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	cov3D[5] = Sigma[2][2];
 }
 
+// Forward method for computing surface normals
+__device__ glm::vec3 computeNormal(const glm::vec3 scale, float mod, const glm::vec4 rot)
+{
+	// Get minimum scale factor
+	float minComponent = scale.x;
+	glm::vec3 minAxis = glm::vec3(1, 0, 0);
+
+    if (scale.y < minComponent) {
+        minComponent = scale.y;
+		minAxis = glm::vec3(0, 1, 0);
+    }
+
+    if (scale.z < minComponent) {
+        minComponent = scale.z;
+		minAxis = glm::vec3(0, 0, 1);
+    }
+
+	// Normalize quaternion to get valid rotation
+	glm::vec4 q = rot;
+	float r = q.x;
+	float x = q.y;
+	float y = q.z;
+	float z = q.w;
+
+	// Compute rotation matrix from quaternion
+	glm::mat3 R = glm::mat3(
+		1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
+		2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
+		2.f * (x * z - r * y), 2.f * (y * z + r * x), 1.f - 2.f * (x * x + y * y)
+	);
+
+	// Rotate direction with minimum scaling factor
+	glm::vec3 finalNormal = R * minAxis;
+
+	// Return normals
+	return finalNormal;
+}
+
 // Perform initial steps for each Gaussian prior to rasterization.
 template<int C>
 __global__ void preprocessCUDA(int P, int D, int M,
@@ -174,6 +212,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	int* radii,
 	float2* points_xy_image,
 	float* depths,
+	float* normals,
 	float* cov3Ds,
 	float* rgb,
 	float4* conic_opacity,
@@ -216,6 +255,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// Compute 2D screen-space covariance matrix
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
+
+	// Compute surface normal
+	glm::vec3 normal = computeNormal(scales[idx], scale_modifier, rotations[idx]);
+	normals[idx * 3 + 0] = normal.x;
+	normals[idx * 3 + 1] = normal.y;
+	normals[idx * 3 + 2] = normal.z;
 
 	// Invert covariance (EWA algorithm)
 	float det = (cov.x * cov.z - cov.y * cov.y);
@@ -274,7 +319,9 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	const float* __restrict__ depth,
-	float* __restrict__ out_depth, 
+	const float* __restrict__ normal,
+	float* __restrict__ out_depth,
+	float* __restrict__ out_normal, 
 	float* __restrict__ out_opacity,
 	int * __restrict__ n_touched)
 {
@@ -309,6 +356,7 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+	float N[3] = { 0 };
 	float D = 0.0f;
 
 	// Iterate over batches until all done or range is complete
@@ -351,9 +399,8 @@ renderCUDA(
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f) {
+			if (alpha < 1.0f / 255.0f)
 				continue;
-			}
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
 			{
@@ -363,6 +410,9 @@ renderCUDA(
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++) {
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+			}
+			for (int ch = 0; ch < 3; ch++) {
+				N[ch] += normal[collected_id[j] * 3 + ch] * alpha * T;
 			}
 			D += collected_depth[j] * alpha * T;
 			// Keep track of how many pixels touched this Gaussian.
@@ -386,6 +436,9 @@ renderCUDA(
 		for (int ch = 0; ch < CHANNELS; ch++) {
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 		}
+		for (int ch = 0; ch < 3; ch++) {
+			out_normal[ch * H * W + pix_id] = N[ch];
+		}
 		out_depth[pix_id] = D;
 		out_opacity[pix_id] = 1 - T;
 	}
@@ -404,7 +457,9 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color,
 	const float* depth,
+	const float* normal,
 	float* out_depth, 
+	float* out_normal,
 	float* out_opacity,
 	int* n_touched)
 {
@@ -420,7 +475,9 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		depth,
+		normal,
 		out_depth,
+		out_normal,
 		out_opacity,
 		n_touched);
 }
@@ -444,6 +501,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	int* radii,
 	float2* means2D,
 	float* depths,
+	float* normals,
 	float* cov3Ds,
 	float* rgb,
 	float4* conic_opacity,
@@ -471,6 +529,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		radii,
 		means2D,
 		depths,
+		normals,
 		cov3Ds,
 		rgb,
 		conic_opacity,

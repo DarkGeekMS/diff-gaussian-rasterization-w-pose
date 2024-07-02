@@ -40,6 +40,7 @@ namespace FORWARD
 		int* radii,
 		float2* points_xy_image,
 		float* depths,
+		float* normals,
 		float* cov3Ds,
 		float* colors,
 		float4* conic_opacity,
@@ -61,7 +62,9 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color,
 		const float* depth,
-	    float* out_depth,
+	    const float* normal,
+		float* out_depth, 
+		float* out_normal,
 		float* out_opacity,
 		int* n_touched);
 }
